@@ -1,8 +1,13 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"os/signal"
+	"syscall"
 
+	"github.com/fardeensayyed16/orclet/internal/worker"
 	"github.com/fardeensayyed16/orclet/pkg/config"
 	"github.com/spf13/cobra"
 )
@@ -23,8 +28,41 @@ var workerCmd = &cobra.Command{
 	Use:   "worker [flags]",
 	Short: "Start the Orclet worker node agent",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Printf("Starting Orclet worker node... Connecting to server %s\n", config.GlobalConfig.Server)
-		return nil
+		cfg := &config.GlobalConfig
+
+		// Override config struct fields with explicit CLI flags if provided
+		if workerServer != "" {
+			cfg.Server = workerServer
+		}
+		if workerToken != "" {
+			cfg.Token = workerToken
+		}
+		if workerName != "" {
+			cfg.Name = workerName
+		}
+		if workerAddress != "" {
+			cfg.Address = workerAddress
+		}
+		if workerDockerSocket != "" {
+			cfg.DockerSocket = workerDockerSocket
+		}
+		if workerCapacityCPU > 0 {
+			cfg.CapacityCPU = workerCapacityCPU
+		}
+		if workerCapacityMemory > 0 {
+			cfg.CapacityMemory = workerCapacityMemory
+		}
+		if workerHostPortRange != "" {
+			cfg.HostPortRange = workerHostPortRange
+		}
+
+		fmt.Printf("Starting Orclet worker node... Connecting to server %s\n", cfg.Server)
+
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		agent := worker.NewWorkerAgent(cfg)
+		return agent.Run(ctx)
 	},
 }
 
