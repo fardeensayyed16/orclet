@@ -3,8 +3,6 @@ module github.com/fardeensayyed16/orclet
 go 1.27
 
 require (
-	github.com/docker/docker v20.10.24+incompatible
-	github.com/fardeensayyed16/orca/pkg/types v0.0.0-00010101000000-000000000000
 	github.com/spf13/cobra v1.8.0
 	github.com/spf13/viper v1.18.2
 )
