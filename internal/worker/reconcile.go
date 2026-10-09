@@ -36,6 +36,8 @@ type desiredReplica struct {
 	PullPolicy          types.PullPolicy    `json:"pull_policy"`
 	Env                 map[string]string   `json:"env"`
 	Command             []string            `json:"command"`
+	Liveness            *types.Probe        `json:"liveness"`
+	Readiness           *types.Probe        `json:"readiness"`
 }
 
 type replicaObservation struct {
@@ -61,9 +63,11 @@ func (w *WorkerAgent) workLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
+		w.reconcileMu.Lock()
 		if err := w.reconcile(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("Work reconciliation error: %v", err)
 		}
+		w.reconcileMu.Unlock()
 		select {
 		case <-ctx.Done():
 			return
@@ -119,6 +123,7 @@ func (w *WorkerAgent) reconcile(ctx context.Context) error {
 	for _, replica := range desired {
 		desiredByID[replica.ID] = replica
 	}
+	w.setDesired(desired)
 	w.pruneReplicaState(desiredByID)
 	desiredIDs := make(map[string]struct{}, len(desiredByID))
 	for id := range desiredByID {
@@ -170,6 +175,10 @@ func (w *WorkerAgent) reconcile(ctx context.Context) error {
 			}
 		}
 		if len(matches) == 0 {
+			if observation, ok := w.observation(replica.ID); ok &&
+				(observation.Status == types.PodStatusFailed || observation.Status == types.PodStatusCompleted) {
+				continue
+			}
 			w.createDesired(ctx, replica, replica.DesiredRestartCount)
 			continue
 		}
@@ -179,6 +188,10 @@ func (w *WorkerAgent) reconcile(ctx context.Context) error {
 }
 
 func (w *WorkerAgent) reconcileExisting(ctx context.Context, desired desiredReplica, summary container.Summary) {
+	if observation, ok := w.observation(desired.ID); ok &&
+		(observation.Status == types.PodStatusFailed || observation.Status == types.PodStatusCompleted) {
+		return
+	}
 	result, err := w.docker.ContainerInspect(ctx, summary.ID, client.ContainerInspectOptions{Size: false})
 	if err != nil {
 		w.recordFailure(desired, summary.ID, 0, desired.DesiredRestartCount, "inspect failed: "+err.Error())
@@ -231,7 +244,12 @@ func (w *WorkerAgent) reconcileExisting(ctx context.Context, desired desiredRepl
 	if state.Status == "exited" || state.Status == "dead" {
 		if requiresRestart(desired.RestartPolicy, state.ExitCode) {
 			if !w.restartReady(desired.ID, restartCount) {
-				w.recordState(desired, summary.ID, hostPort, restartCount, state, "restart backoff")
+				w.recordObservation(replicaObservation{
+					ID: desired.ID, ContainerID: summary.ID, HostPort: hostPort,
+					Status: types.PodStatusStarting, Health: types.HealthStatusUnknown,
+					RestartCount: restartCount, ExitCode: state.ExitCode,
+					Message: "restart backoff", MemoryBytes: desired.MemoryBytes,
+				})
 				return
 			}
 			if err := w.removeContainer(ctx, summary.ID); err != nil {
@@ -361,6 +379,7 @@ func (w *WorkerAgent) createDesired(ctx context.Context, desired desiredReplica,
 		w.recordFailure(desired, created.ID, hostPort, restartCount, "start failed: "+err.Error())
 		return
 	}
+	w.setProbeState(desired.ID, probeState{})
 	w.recordObservation(replicaObservation{
 		ID: desired.ID, ContainerID: created.ID, HostPort: hostPort,
 		Status: types.PodStatusStarting, Health: types.HealthStatusUnknown,
@@ -383,8 +402,26 @@ func (w *WorkerAgent) recordState(desired desiredReplica, id string, hostPort, r
 	switch state.Status {
 	case "running", "paused":
 		status = types.PodStatusRunning
-		health = types.HealthStatusHealthy
-		ready = true
+		if desired.Liveness == nil && desired.Readiness == nil {
+			health = types.HealthStatusHealthy
+			ready = true
+		} else {
+			health = types.HealthStatusUnknown
+			if desired.Liveness == nil {
+				health = types.HealthStatusHealthy
+			}
+			if desired.Readiness == nil {
+				ready = true
+			}
+			if previous, ok := w.observation(desired.ID); ok && previous.ContainerID == id {
+				if desired.Liveness != nil {
+					health = previous.Health
+				}
+				if desired.Readiness != nil {
+					ready = previous.Ready
+				}
+			}
+		}
 	case "created", "restarting":
 		status = types.PodStatusStarting
 	case "exited", "dead":
@@ -471,6 +508,13 @@ func (w *WorkerAgent) pruneReplicaState(desired map[string]desiredReplica) {
 		}
 	}
 	w.restartMu.Unlock()
+	w.probeMu.Lock()
+	for id := range w.probes {
+		if _, ok := desired[id]; !ok {
+			delete(w.probes, id)
+		}
+	}
+	w.probeMu.Unlock()
 }
 
 func (w *WorkerAgent) restartReady(id string, count int) bool {
@@ -617,12 +661,30 @@ func (w *WorkerAgent) collectReplicaHeartbeats(ctx context.Context) []replicaObs
 		if inspected.Container.HostConfig != nil {
 			observed.MemoryBytes = inspected.Container.HostConfig.Resources.Memory
 		}
+		if previousIndex, ok := byID[replicaID]; ok {
+			previous := result[previousIndex]
+			if previous.Status == types.PodStatusFailed || previous.Status == types.PodStatusCompleted {
+				continue
+			}
+			if desired, exists := w.desiredSnapshot()[replicaID]; exists &&
+				(desired.Liveness != nil || desired.Readiness != nil) {
+				observed.Health = previous.Health
+				observed.Ready = previous.Ready
+			}
+		} else if desired, exists := w.desiredSnapshot()[replicaID]; exists &&
+			(desired.Liveness != nil || desired.Readiness != nil) {
+			observed.Health = types.HealthStatusUnknown
+			observed.Ready = desired.Readiness == nil
+		}
 		state := inspected.Container.State
 		switch state.Status {
 		case "running", "paused":
 			observed.Status = types.PodStatusRunning
-			observed.Health = types.HealthStatusHealthy
-			observed.Ready = true
+			if desired, exists := w.desiredSnapshot()[replicaID]; !exists ||
+				(desired.Liveness == nil && desired.Readiness == nil) {
+				observed.Health = types.HealthStatusHealthy
+				observed.Ready = true
+			}
 		case "exited", "dead":
 			if state.ExitCode == 0 {
 				observed.Status = types.PodStatusCompleted

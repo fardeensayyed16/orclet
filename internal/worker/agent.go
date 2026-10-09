@@ -27,6 +27,11 @@ type WorkerAgent struct {
 	observations   map[string]replicaObservation
 	restartMu      sync.Mutex
 	restarts       map[string]restartState
+	reconcileMu    sync.Mutex
+	desiredMu      sync.RWMutex
+	desired        map[string]desiredReplica
+	probeMu        sync.Mutex
+	probes         map[string]probeState
 }
 
 func NewWorkerAgent(cfg *config.Config) *WorkerAgent {
@@ -35,6 +40,8 @@ func NewWorkerAgent(cfg *config.Config) *WorkerAgent {
 		dockerMgr:    NewDockerClientManager(cfg.DockerSocket),
 		observations: make(map[string]replicaObservation),
 		restarts:     make(map[string]restartState),
+		desired:      make(map[string]desiredReplica),
+		probes:       make(map[string]probeState),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -78,6 +85,7 @@ func (w *WorkerAgent) Run(ctx context.Context) error {
 	}
 
 	go w.workLoop(ctx)
+	go w.healthLoop(ctx)
 	w.heartbeatLoop(ctx)
 	return nil
 }
