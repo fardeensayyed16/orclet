@@ -10,21 +10,31 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/fardeensayyed16/orclet/internal/runtime"
 	"github.com/fardeensayyed16/orclet/pkg/config"
 )
 
 type WorkerAgent struct {
-	cfg        *config.Config
-	dockerMgr  *DockerClientManager
-	httpClient *http.Client
+	cfg            *config.Config
+	dockerMgr      *DockerClientManager
+	docker         runtime.DockerRuntime
+	portPool       *portPool
+	httpClient     *http.Client
+	observationsMu sync.RWMutex
+	observations   map[string]replicaObservation
+	restartMu      sync.Mutex
+	restarts       map[string]restartState
 }
 
 func NewWorkerAgent(cfg *config.Config) *WorkerAgent {
 	return &WorkerAgent{
-		cfg:       cfg,
-		dockerMgr: NewDockerClientManager(cfg.DockerSocket),
+		cfg:          cfg,
+		dockerMgr:    NewDockerClientManager(cfg.DockerSocket),
+		observations: make(map[string]replicaObservation),
+		restarts:     make(map[string]restartState),
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -44,12 +54,30 @@ func (w *WorkerAgent) Run(ctx context.Context) error {
 	}
 	w.cfg.Name = nodeName
 
+	address, err := resolveNodeAddress(w.cfg.Address, w.cfg.Server)
+	if err != nil {
+		return err
+	}
+	w.cfg.Address = address
+	w.docker, err = runtime.NewDockerRuntime(w.cfg.DockerSocket)
+	if err != nil {
+		return err
+	}
+	if w.cfg.HostPortRange == "" {
+		w.cfg.HostPortRange = "40000-41000"
+	}
+	w.portPool, err = newPortPool(w.cfg.HostPortRange)
+	if err != nil {
+		return err
+	}
+	defer w.portPool.close()
+
 	// 1. One-shot Registration with retry/backoff
 	if err := w.registerWithBackoff(ctx); err != nil {
 		return err
 	}
 
-	// 2. Start Heartbeat Loop (every 5 seconds)
+	go w.workLoop(ctx)
 	w.heartbeatLoop(ctx)
 	return nil
 }
@@ -68,7 +96,7 @@ func (w *WorkerAgent) registerWithBackoff(ctx context.Context) error {
 		// Re-check Docker health & capacities before each registration attempt
 		cpuMillis, memBytes, dockerOK, err := w.dockerMgr.CheckHealth(ctx)
 		if err != nil {
-			log.Fatalf("Fatal Docker error: %v", err)
+			log.Printf("Docker health check error: %v", err)
 		}
 
 		if !dockerOK {
@@ -188,11 +216,12 @@ func (w *WorkerAgent) heartbeatLoop(ctx context.Context) {
 }
 
 type heartbeatReq struct {
-	Address             string   `json:"address"`
-	ContainerIDs        []string `json:"container_ids"`
-	DockerOK            bool     `json:"docker_ok"`
-	CapacityCPUMillis   int64    `json:"capacity_cpu_millis,omitempty"`
-	CapacityMemoryBytes int64    `json:"capacity_memory_bytes,omitempty"`
+	Address             string               `json:"address"`
+	ContainerIDs        []string             `json:"container_ids"`
+	Replicas            []replicaObservation `json:"replicas"`
+	DockerOK            bool                 `json:"docker_ok"`
+	CapacityCPUMillis   int64                `json:"capacity_cpu_millis,omitempty"`
+	CapacityMemoryBytes int64                `json:"capacity_memory_bytes,omitempty"`
 }
 
 func (w *WorkerAgent) sendHeartbeat(ctx context.Context) error {
@@ -212,10 +241,18 @@ func (w *WorkerAgent) sendHeartbeat(ctx context.Context) error {
 		serverURL = "http://" + serverURL
 	}
 	url := fmt.Sprintf("%s/api/v1/nodes/%s/heartbeat", serverURL, w.cfg.Name)
+	replicas := w.collectReplicaHeartbeats(ctx)
+	containerIDs := make([]string, 0, len(replicas))
+	for _, replica := range replicas {
+		if replica.ContainerID != "" {
+			containerIDs = append(containerIDs, replica.ContainerID)
+		}
+	}
 
 	reqBody := heartbeatReq{
 		Address:             w.cfg.Address,
-		ContainerIDs:        []string{},
+		ContainerIDs:        containerIDs,
+		Replicas:            replicas,
 		DockerOK:            dockerOK,
 		CapacityCPUMillis:   cpuMillis,
 		CapacityMemoryBytes: memBytes,
