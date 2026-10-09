@@ -86,6 +86,7 @@ func (w *WorkerAgent) Run(ctx context.Context) error {
 
 	go w.workLoop(ctx)
 	go w.healthLoop(ctx)
+	go w.statsLoop(ctx)
 	w.heartbeatLoop(ctx)
 	return nil
 }
