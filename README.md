@@ -22,8 +22,60 @@ Orclet runs on every worker machine in an Orca cluster. It registers with the Or
 - 🔄 Adoption — Reconnects to running containers after a restart.
 
 ---
+#### 🖥️ Platform Support
+
+Orclet runs on each *worker machine* in an Orca cluster. It targets 
+*Windows machines* with *Docker Desktop (WSL2 backend)*.
+
+### Recommended: Windows with WSL2
+
+Docker Desktop on Windows uses WSL2 as its backend. Container 
+operations run inside a WSL2 Linux VM.
+
+*Setup:*
+
+1. Install *Docker Desktop* for Windows — enable WSL2 backend
+2. Install *Go 1.22+* inside WSL2 Ubuntu:
+   ```bash
+   cd ~
+   wget https://go.dev/dl/go1.27.0.linux-amd64.tar.gz
+   sudo tar -C /usr/local -xzf go1.27.0.linux-amd64.tar.gz
+   export PATH=$PATH:/usr/local/go/bin
+   go version
+
+
+   ##Build and Run inside Wsl2 Ubuntu terminal
+   cd ~/orca-project/orclet
+go build -o orclet ./cmd/orclet
+./orclet worker \
+  --server=http://<DAEMON-IP>:9001 \
+  --token=<TOKEN> \
+  --name=node-1
+
+  Windows Native (Advanced)
+  $env:GOOS="windows"; $env:GOARCH="amd64"
+go build -o orclet.exe ./cmd/orclet
+.\orclet.exe worker --server=http://<DAEMON-IP>:9001 --token=<TOKEN> --name=node-1
+
+#Running as a Windows Service (V2)
+# Admin PowerShell
+sc.exe create Orclet binPath= "C:\Tools\orclet.exe worker --config=C:\ProgramData\orclet\config.yaml" start= auto
+sc.exe failure Orclet reset= 86400 actions= restart/5000/restart/5000/restart/5000
+sc.exe start Orclet
+sc.exe query Orclet
+
+Window firewall rule(Admin PowerShell)
+# On orclet machine — allow host port pool from daemon IP only
+netsh advfirewall firewall add rule name="orca-pool" dir=in action=allow protocol=TCP localport=40000-41000 remoteip=<DAEMON-IP>
+
+##Ports
+Port Range Purpose
+40000-41000 Host port pool for published container ports
+
+
 
 🚀 Quick Start
+
 
 1. Build
 
